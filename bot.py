@@ -26,14 +26,20 @@ def save_tasks(tasks):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     welcome_message = (
         "👋🧑🏻‍💻 Welcome to Havoc Bot!\n\n"
-        "Available commands:\n\n"
+        "📝 Task Commands:\n\n"
         "/add <task> - Add a new task\n"
         "/list - Show all your tasks\n"
         "/done <task_number> - Mark task as done\n"
         "/remove <task_number> - Remove a task\n"
         "/edit <task_number> <new_task> - Edit a task\n"
-        "/reminder <task_number> <HH:MM> <days> - Set daily reminder\n"
-        "/clear - Delete all your tasks\n"
+        "/clear - Delete all your tasks\n\n"
+
+        "⏰ Reminder Commands:\n\n"
+        "/reminder <task_number> <HH:MM> <days_number> - Set daily reminder\n"
+        "/listreminders - List all your reminders\n"
+        "/removereminder <reminder_number> - Remove a reminder\n"
+        "/clearreminders - Clear all your reminders\n\n"
+
         "/start - Show this message"
     )
     await update.message.reply_text(welcome_message)
@@ -58,8 +64,6 @@ async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     save_tasks(tasks_data)
     await update.message.reply_text(f"✅🧑🏻‍💻 Task added: {task_text} (ID: {task_id})")
 
-
-
 async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = str(update.effective_user.id)
     tasks_data = load_tasks()  # always load fresh
@@ -72,9 +76,9 @@ async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     tasks = tasks_data[user_id]["tasks"]
 
     # Build the task list message
-    message = "🧑🏻‍💻 Your Tasks:\n\n"
+    message = "🕓🧑🏻‍💻 Your Tasks:\n\n"
     for idx, task in enumerate(tasks, 1):
-        status = "✅" if task["done"] else "⏳"
+        status = "✅" if task["done"] else "🕓"
         message += f"{idx}. {status} {task['task']}\n"
 
     await update.message.reply_text(message)
@@ -277,6 +281,78 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
             name=job.name
         )
 
+async def list_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = str(update.effective_user.id)
+    tasks_data = load_tasks()
+
+    if user_id not in tasks_data or not tasks_data[user_id].get("reminders"):
+        await update.message.reply_text("📭🧑🏻‍💻 You have no reminders set!")
+        return
+
+    reminders = tasks_data[user_id]["reminders"]
+    message = "⏰🧑🏻‍💻 Your reminders:\n\n"
+
+    for idx, rem in enumerate(reminders, 1):
+        task = next((t for t in tasks_data[user_id]["tasks"] if t["id"] == rem["task_id"]), None)
+        task_text = task["task"] if task else "(deleted task)"
+        message += f"{idx}. {task_text} at {rem['time']} ({rem['days_left']} day(s) left)\n"
+
+    await update.message.reply_text(message)
+
+async def remove_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = str(update.effective_user.id)
+    tasks_data = load_tasks()
+
+    if user_id not in tasks_data or not tasks_data[user_id].get("reminders"):
+        await update.message.reply_text("📭🧑🏻‍💻 You have no reminders to remove!")
+        return
+
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("❌🧑🏻‍💻 Usage: /removereminder <reminder_number>")
+        return
+
+    rem_index = int(context.args[0]) - 1
+    reminders = tasks_data[user_id]["reminders"]
+
+    if rem_index < 0 or rem_index >= len(reminders):
+        await update.message.reply_text("❌🧑🏻‍💻 Invalid reminder number!")
+        return
+
+    removed = reminders.pop(rem_index)
+    save_tasks(tasks_data)
+
+    # Cancel scheduled job
+    job_name = f"{user_id}_{removed['task_id']}_{removed['time'].replace(':','')}"
+    for job in context.job_queue.jobs():
+        if job.name == job_name:
+            job.schedule_removal()
+
+    task = next((t for t in tasks_data[user_id]["tasks"] if t["id"] == removed["task_id"]), None)
+    task_text = task["task"] if task else "(deleted task)"
+
+    await update.message.reply_text(f"🗑️🧑🏻‍💻 Removed reminder for '{task_text}' at {removed['time']}")
+
+async def clear_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = str(update.effective_user.id)
+    tasks_data = load_tasks()
+
+    if user_id not in tasks_data or not tasks_data[user_id].get("reminders"):
+        await update.message.reply_text("📭🧑🏻‍💻 You have no reminders to clear!")
+        return
+
+    # Cancel all scheduled jobs for this user
+    for rem in tasks_data[user_id]["reminders"]:
+        job_name = f"{user_id}_{rem['task_id']}_{rem['time'].replace(':','')}"
+        for job in context.job_queue.jobs():
+            if job.name == job_name:
+                job.schedule_removal()
+
+    count = len(tasks_data[user_id]["reminders"])
+    tasks_data[user_id]["reminders"] = []
+    save_tasks(tasks_data)
+
+    await update.message.reply_text(f"🗑️🧑🏻‍💻 Cleared {count} reminder(s)!")
+
 def main() -> None:
     token = os.getenv("TELEGRAM_TOKEN")
     if not token:
@@ -295,6 +371,9 @@ def main() -> None:
     application.add_handler(CommandHandler("edit", edit_task))
     application.add_handler(CommandHandler("clear", clear_tasks))
     application.add_handler(CommandHandler("reminder", reminder))
+    application.add_handler(CommandHandler("listreminders", list_reminders))
+    application.add_handler(CommandHandler("removereminder", remove_reminder))
+    application.add_handler(CommandHandler("clearreminders", clear_reminders))
 
     # Reschedule reminders before run_polling
     tasks_data = load_tasks()
