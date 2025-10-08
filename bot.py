@@ -1,8 +1,8 @@
 import os
 import json
 from datetime import datetime, timedelta
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes, JobQueue
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, ContextTypes, JobQueue, CallbackQueryHandler
 from dotenv import load_dotenv
 import random
 
@@ -66,22 +66,23 @@ async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = str(update.effective_user.id)
-    tasks_data = load_tasks()  # always load fresh
+    tasks_data = load_tasks()
 
-    # Check if user has any tasks
     if user_id not in tasks_data or "tasks" not in tasks_data[user_id] or not tasks_data[user_id]["tasks"]:
         await update.message.reply_text("📭🧑🏻‍💻 You have no tasks yet! Use /add to create one.")
         return
 
     tasks = tasks_data[user_id]["tasks"]
-
-    # Build the task list message
     message = "🕓🧑🏻‍💻 Your Tasks:\n\n"
     for idx, task in enumerate(tasks, 1):
         status = "✅" if task["done"] else "🕓"
         message += f"{idx}. {status} {task['task']}\n"
 
-    await update.message.reply_text(message)
+    # Add inline button
+    keyboard = [[InlineKeyboardButton("🗑️ clear all tasks", callback_data="clear_all_tasks")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text(message, reply_markup=reply_markup)
 
 async def done_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = str(update.effective_user.id)
@@ -297,7 +298,11 @@ async def list_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         task_text = task["task"] if task else "(deleted task)"
         message += f"{idx}. {task_text} at {rem['time']} ({rem['days_left']} day(s) left)\n"
 
-    await update.message.reply_text(message)
+    # Add inline button
+    keyboard = [[InlineKeyboardButton("🗑️ clear all reminders", callback_data="clear_all_reminders")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text(message, reply_markup=reply_markup)
 
 async def remove_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = str(update.effective_user.id)
@@ -353,6 +358,40 @@ async def clear_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     await update.message.reply_text(f"🗑️🧑🏻‍💻 Cleared {count} reminder(s)!")
 
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    user_id = str(update.effective_user.id)
+    tasks_data = load_tasks()
+
+    if query.data == "clear_all_tasks":
+        if user_id not in tasks_data or "tasks" not in tasks_data[user_id] or not tasks_data[user_id]["tasks"]:
+            await query.edit_message_text("📭🧑🏻‍💻 You have no tasks to clear!")
+            return
+
+        task_count = len(tasks_data[user_id]["tasks"])
+        tasks_data[user_id]["tasks"] = []
+        save_tasks(tasks_data)
+        await query.edit_message_text(f"🗑️🧑🏻‍💻 Cleared {task_count} task(s)!")
+
+    elif query.data == "clear_all_reminders":
+        if user_id not in tasks_data or not tasks_data[user_id].get("reminders"):
+            await query.edit_message_text("📭🧑🏻‍💻 You have no reminders to clear!")
+            return
+
+        # Cancel all scheduled jobs
+        for rem in tasks_data[user_id]["reminders"]:
+            job_name = f"{user_id}_{rem['task_id']}_{rem['time'].replace(':', '')}"
+            for job in context.job_queue.jobs():
+                if job.name == job_name:
+                    job.schedule_removal()
+
+        count = len(tasks_data[user_id]["reminders"])
+        tasks_data[user_id]["reminders"] = []
+        save_tasks(tasks_data)
+        await query.edit_message_text(f"🗑️🧑🏻‍💻 Cleared {count} reminder(s)!")
+
 def main() -> None:
     token = os.getenv("TELEGRAM_TOKEN")
     if not token:
@@ -374,6 +413,7 @@ def main() -> None:
     application.add_handler(CommandHandler("listreminders", list_reminders))
     application.add_handler(CommandHandler("removereminder", remove_reminder))
     application.add_handler(CommandHandler("clearreminders", clear_reminders))
+    application.add_handler(CallbackQueryHandler(button_callback))
 
     # Reschedule reminders before run_polling
     tasks_data = load_tasks()
