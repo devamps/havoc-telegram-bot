@@ -1,33 +1,15 @@
 import os
-import json
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, ContextTypes, JobQueue, CallbackQueryHandler
+from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
 from dotenv import load_dotenv
 import uuid
+import db
 
 load_dotenv()
 
-TASKS_FILE = "tasks.json"
-
-def load_tasks():
-    if os.path.exists(TASKS_FILE):
-        try:
-            with open(TASKS_FILE, "r") as f:
-                return json.load(f)
-        except json.JSONDecodeError:
-            return {}
-    return {}
-
-def save_tasks(tasks):
-    with open(TASKS_FILE, "w") as f:
-        json.dump(tasks, f, indent=2)
-
-def generate_unique_task_id(existing_tasks):
-    while True:
-        task_id = uuid.uuid4().hex[:8]
-        if not any(t["id"] == task_id for t in existing_tasks):
-            return task_id
+def generate_unique_task_id():
+    return uuid.uuid4().hex[:8]
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     welcome_message = (
@@ -52,7 +34,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = str(update.effective_user.id)
-    tasks_data = load_tasks()
 
     if not context.args:
         await update.message.reply_text("❌🧑🏻‍💻 Please provide a task! Usage: /add <task>")
@@ -60,25 +41,20 @@ async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     task_text = " ".join(context.args)
 
-    if user_id not in tasks_data:
-        tasks_data[user_id] = {"tasks": [], "reminders": []}
-
     # Generate unique task ID
-    task_id = generate_unique_task_id(tasks_data[user_id]["tasks"])
-    tasks_data[user_id]["tasks"].append({"id": task_id, "task": task_text, "done": False})
+    task_id = generate_unique_task_id()
 
-    save_tasks(tasks_data)
+    db.add_task(user_id, task_id, task_text)
     await update.message.reply_text(f"✅🧑🏻‍💻 Task added: {task_text} (ID: {task_id})")
 
 async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = str(update.effective_user.id)
-    tasks_data = load_tasks()
+    tasks = db.get_user_tasks(user_id)
 
-    if user_id not in tasks_data or "tasks" not in tasks_data[user_id] or not tasks_data[user_id]["tasks"]:
+    if not tasks:
         await update.message.reply_text("📭🧑🏻‍💻 You have no tasks yet! Use /add to create one.")
         return
 
-    tasks = tasks_data[user_id]["tasks"]
     message = "🕓🧑🏻‍💻 Your Tasks:\n\n"
     for idx, task in enumerate(tasks, 1):
         status = "✅" if task["done"] else "🕓"
@@ -92,10 +68,10 @@ async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def done_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = str(update.effective_user.id)
-    tasks_data = load_tasks()  # load fresh
+    tasks = db.get_user_tasks(user_id)
 
-    # Check if user exists and has any tasks
-    if user_id not in tasks_data or "tasks" not in tasks_data[user_id] or not tasks_data[user_id]["tasks"]:
+    # Check if user has any tasks
+    if not tasks:
         await update.message.reply_text("📭🧑🏻‍💻 You have no tasks to mark as done!")
         return
 
@@ -105,25 +81,24 @@ async def done_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     task_num = int(context.args[0]) - 1
-    tasks_list = tasks_data[user_id]["tasks"]
 
     # Check if number is within range
-    if task_num < 0 or task_num >= len(tasks_list):
+    if task_num < 0 or task_num >= len(tasks):
         await update.message.reply_text("❌🧑🏻‍💻 Invalid task number!")
         return
 
     # Mark task as done
-    tasks_list[task_num]["done"] = True
-    save_tasks(tasks_data)
+    task_id = tasks[task_num]["id"]
+    db.update_task_status(user_id, task_id, done=True)
 
     await update.message.reply_text(f"✅🧑🏻‍💻 Task {task_num + 1} marked as done!")
 
 async def remove_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = str(update.effective_user.id)
-    tasks_data = load_tasks()  # load fresh
+    tasks = db.get_user_tasks(user_id)
 
-    # Check if user exists and has any tasks
-    if user_id not in tasks_data or "tasks" not in tasks_data[user_id] or not tasks_data[user_id]["tasks"]:
+    # Check if user has any tasks
+    if not tasks:
         await update.message.reply_text("📭🧑🏻‍💻 You have no tasks to remove!")
         return
 
@@ -133,54 +108,42 @@ async def remove_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     task_num = int(context.args[0]) - 1
-    tasks_list = tasks_data[user_id]["tasks"]
 
     # Check if number is within range
-    if task_num < 0 or task_num >= len(tasks_list):
+    if task_num < 0 or task_num >= len(tasks):
         await update.message.reply_text("❌🧑🏻‍💻 Invalid task number!")
         return
 
-    # Remove the task
-    removed_task = tasks_list.pop(task_num)
+    removed_task = tasks[task_num]
     task_id = removed_task["id"]
 
-    # Remove associated reminders and cancel their jobs
-    reminders_removed = 0
-    if "reminders" in tasks_data[user_id]:
-        # Find reminders to remove
-        reminders_to_remove = [
-            r for r in tasks_data[user_id]["reminders"]
-            if r["task_id"] == task_id
-        ]
-        reminders_removed = len(reminders_to_remove)
+    # Get reminders before deletion to count them
+    reminders = db.get_user_reminders(user_id)
+    reminders_to_remove = [r for r in reminders if r["task_id"] == task_id]
+    reminders_count = len(reminders_to_remove)
 
-        # Remove from list
-        tasks_data[user_id]["reminders"] = [
-            r for r in tasks_data[user_id]["reminders"]
-            if r["task_id"] != task_id
-        ]
+    # Cancel scheduled jobs
+    for rem in reminders_to_remove:
+        job_name = f"{user_id}_{task_id}_{rem['time'].replace(':', '')}"
+        for job in context.job_queue.jobs():
+            if job.name == job_name:
+                job.schedule_removal()
 
-        # Cancel scheduled jobs
-        for rem in reminders_to_remove:
-            job_name = f"{user_id}_{task_id}_{rem['time'].replace(':', '')}"
-            for job in context.job_queue.jobs():
-                if job.name == job_name:
-                    job.schedule_removal()
-
-    save_tasks(tasks_data)
+    # Delete task (cascades to reminders in DB)
+    db.delete_task(user_id, task_id)
 
     response = f"🗑️🧑🏻‍💻 Removed task: {removed_task['task']}"
-    if reminders_removed > 0:
-        response += f"\n(Also removed {reminders_removed} associated reminder(s))"
+    if reminders_count > 0:
+        response += f"\n(Also removed {reminders_count} associated reminder(s))"
 
     await update.message.reply_text(response)
 
 async def edit_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = str(update.effective_user.id)
-    tasks_data = load_tasks()  # load fresh
+    tasks = db.get_user_tasks(user_id)
 
-    # Check if user exists and has any tasks
-    if user_id not in tasks_data or "tasks" not in tasks_data[user_id] or not tasks_data[user_id]["tasks"]:
+    # Check if user has any tasks
+    if not tasks:
         await update.message.reply_text("📭🧑🏻‍💻 You have no tasks to edit!")
         return
 
@@ -191,46 +154,44 @@ async def edit_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     task_num = int(context.args[0]) - 1
     new_task_text = " ".join(context.args[1:])
-    tasks_list = tasks_data[user_id]["tasks"]
 
     # Check if number is within range
-    if task_num < 0 or task_num >= len(tasks_list):
+    if task_num < 0 or task_num >= len(tasks):
         await update.message.reply_text("❌🧑🏻‍💻 Invalid task number!")
         return
 
     # Replace old text with new one
-    old_task = tasks_list[task_num]["task"]
-    tasks_list[task_num]["task"] = new_task_text
-    save_tasks(tasks_data)
+    task = tasks[task_num]
+    old_task = task["task"]
+
+    db.update_task_text(user_id, task["id"], new_task_text)
 
     await update.message.reply_text(f"✏️🧑🏻‍💻 Task {task_num + 1} updated:\n'{old_task}' ➝ '{new_task_text}'")
 
 async def clear_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = str(update.effective_user.id)
-    tasks_data = load_tasks()  # load fresh
+    tasks = db.get_user_tasks(user_id)
 
-    # Check if user exists and has any tasks
-    if user_id not in tasks_data or "tasks" not in tasks_data[user_id] or not tasks_data[user_id]["tasks"]:
+    # Check if user has any tasks
+    if not tasks:
         await update.message.reply_text("📭🧑🏻‍💻 You have no tasks to clear!")
         return
 
-    # Clear the tasks
-    task_count = len(tasks_data[user_id]["tasks"])
-    tasks_data[user_id]["tasks"] = []
+    task_count = len(tasks)
 
-    # Also clear all reminders since all tasks are being removed
-    reminders_count = len(tasks_data[user_id].get("reminders", []))
-    if reminders_count > 0:
-        # Cancel all scheduled jobs
-        for rem in tasks_data[user_id]["reminders"]:
-            job_name = f"{user_id}_{rem['task_id']}_{rem['time'].replace(':', '')}"
-            for job in context.job_queue.jobs():
-                if job.name == job_name:
-                    job.schedule_removal()
+    # Get reminders count before clearing
+    reminders = db.get_user_reminders(user_id)
+    reminders_count = len(reminders)
 
-        tasks_data[user_id]["reminders"] = []
+    # Cancel all scheduled jobs
+    for rem in reminders:
+        job_name = f"{user_id}_{rem['task_id']}_{rem['time'].replace(':', '')}"
+        for job in context.job_queue.jobs():
+            if job.name == job_name:
+                job.schedule_removal()
 
-    save_tasks(tasks_data)
+    # Clear all tasks (cascades to reminders)
+    db.clear_all_tasks(user_id)
 
     response = f"🗑️🧑🏻‍💻 Cleared {task_count} task(s)!"
     if reminders_count > 0:
@@ -240,9 +201,9 @@ async def clear_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = str(update.effective_user.id)
-    tasks_data = load_tasks()
+    tasks = db.get_user_tasks(user_id)
 
-    if user_id not in tasks_data or not tasks_data[user_id]["tasks"]:
+    if not tasks:
         await update.message.reply_text("📭🧑🏻‍💻 You have no tasks!")
         return
 
@@ -254,7 +215,6 @@ async def reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     time_str = context.args[1]
     days = int(context.args[2])
 
-    tasks = tasks_data[user_id]["tasks"]
     if task_index < 0 or task_index >= len(tasks):
         await update.message.reply_text("❌🧑🏻‍💻 Invalid task number!")
         return
@@ -268,13 +228,8 @@ async def reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("❌🧑🏻‍💻 Invalid time format! Use HH:MM")
         return
 
-    # Save reminder in JSON
-    tasks_data[user_id]["reminders"].append({
-        "task_id": task_id,
-        "time": time_str,
-        "days_left": days
-    })
-    save_tasks(tasks_data)
+    # Save reminder in DB
+    db.add_reminder(user_id, task_id, time_str, days)
 
     # Schedule first reminder
     now = datetime.now()
@@ -309,16 +264,12 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
         text=f"⏰🧑🏻‍💻 Reminder: {task_text}\n({days_left} day(s) remaining)!"
     )
 
-    # Update JSON
-    tasks_data = load_tasks()
-    reminders = tasks_data.get(user_id, {}).get("reminders", [])
-    for rem in reminders:
-        if rem["task_id"] == task_id and rem["time"] == time_str:
-            rem["days_left"] -= 1
-            if rem["days_left"] <= 0:
-                reminders.remove(rem)
-            break
-    save_tasks(tasks_data)
+    # Update days_left in DB
+    new_days = days_left - 1
+    if new_days <= 0:
+        db.delete_reminder(user_id, task_id, time_str)
+    else:
+        db.update_reminder_days(user_id, task_id, time_str, new_days)
 
     # Schedule next reminder if needed
     if days_left > 1:
@@ -328,24 +279,24 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
         context.job_queue.run_once(
             send_reminder,
             when=delay,
-            data={"user_id": user_id, "task_id": task_id, "task_text": task_text, "days_left": days_left - 1,
+            data={"user_id": user_id, "task_id": task_id, "task_text": task_text, "days_left": new_days,
                   "time": time_str},
             name=job.name
         )
 
 async def list_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = str(update.effective_user.id)
-    tasks_data = load_tasks()
+    reminders = db.get_user_reminders(user_id)
 
-    if user_id not in tasks_data or not tasks_data[user_id].get("reminders"):
+    if not reminders:
         await update.message.reply_text("📭🧑🏻‍💻 You have no reminders set!")
         return
 
-    reminders = tasks_data[user_id]["reminders"]
+    tasks = db.get_user_tasks(user_id)
     message = "⏰🧑🏻‍💻 Your reminders:\n\n"
 
     for idx, rem in enumerate(reminders, 1):
-        task = next((t for t in tasks_data[user_id]["tasks"] if t["id"] == rem["task_id"]), None)
+        task = next((t for t in tasks if t["id"] == rem["task_id"]), None)
         task_text = task["task"] if task else "(deleted task)"
         message += f"{idx}. {task_text} at {rem['time']} ({rem['days_left']} day(s) left)\n"
 
@@ -357,9 +308,9 @@ async def list_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def remove_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = str(update.effective_user.id)
-    tasks_data = load_tasks()
+    reminders = db.get_user_reminders(user_id)
 
-    if user_id not in tasks_data or not tasks_data[user_id].get("reminders"):
+    if not reminders:
         await update.message.reply_text("📭🧑🏻‍💻 You have no reminders to remove!")
         return
 
@@ -368,14 +319,12 @@ async def remove_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     rem_index = int(context.args[0]) - 1
-    reminders = tasks_data[user_id]["reminders"]
 
     if rem_index < 0 or rem_index >= len(reminders):
         await update.message.reply_text("❌🧑🏻‍💻 Invalid reminder number!")
         return
 
-    removed = reminders.pop(rem_index)
-    save_tasks(tasks_data)
+    removed = reminders[rem_index]
 
     # Cancel scheduled job
     job_name = f"{user_id}_{removed['task_id']}_{removed['time'].replace(':', '')}"
@@ -383,29 +332,31 @@ async def remove_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if job.name == job_name:
             job.schedule_removal()
 
-    task = next((t for t in tasks_data[user_id]["tasks"] if t["id"] == removed["task_id"]), None)
+    db.delete_reminder(user_id, removed["task_id"], removed["time"])
+
+    tasks = db.get_user_tasks(user_id)
+    task = next((t for t in tasks if t["id"] == removed["task_id"]), None)
     task_text = task["task"] if task else "(deleted task)"
 
     await update.message.reply_text(f"🗑️🧑🏻‍💻 Removed reminder for '{task_text}' at {removed['time']}")
 
 async def clear_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = str(update.effective_user.id)
-    tasks_data = load_tasks()
+    reminders = db.get_user_reminders(user_id)
 
-    if user_id not in tasks_data or not tasks_data[user_id].get("reminders"):
+    if not reminders:
         await update.message.reply_text("📭🧑🏻‍💻 You have no reminders to clear!")
         return
 
     # Cancel all scheduled jobs for this user
-    for rem in tasks_data[user_id]["reminders"]:
+    for rem in reminders:
         job_name = f"{user_id}_{rem['task_id']}_{rem['time'].replace(':', '')}"
         for job in context.job_queue.jobs():
             if job.name == job_name:
                 job.schedule_removal()
 
-    count = len(tasks_data[user_id]["reminders"])
-    tasks_data[user_id]["reminders"] = []
-    save_tasks(tasks_data)
+    count = len(reminders)
+    db.clear_all_reminders(user_id)
 
     await update.message.reply_text(f"🗑️🧑🏻‍💻 Cleared {count} reminder(s)!")
 
@@ -414,29 +365,26 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await query.answer()
 
     user_id = str(update.effective_user.id)
-    tasks_data = load_tasks()
 
     if query.data == "clear_all_tasks":
-        if user_id not in tasks_data or "tasks" not in tasks_data[user_id] or not tasks_data[user_id]["tasks"]:
+        tasks = db.get_user_tasks(user_id)
+
+        if not tasks:
             await query.edit_message_text("📭🧑🏻‍💻 You have no tasks to clear!")
             return
 
-        task_count = len(tasks_data[user_id]["tasks"])
-        tasks_data[user_id]["tasks"] = []
+        task_count = len(tasks)
+        reminders = db.get_user_reminders(user_id)
+        reminders_count = len(reminders)
 
-        # Also clear all reminders since all tasks are being removed
-        reminders_count = len(tasks_data[user_id].get("reminders", []))
-        if reminders_count > 0:
-            # Cancel all scheduled jobs
-            for rem in tasks_data[user_id]["reminders"]:
-                job_name = f"{user_id}_{rem['task_id']}_{rem['time'].replace(':', '')}"
-                for job in context.job_queue.jobs():
-                    if job.name == job_name:
-                        job.schedule_removal()
+        # Cancel all scheduled jobs
+        for rem in reminders:
+            job_name = f"{user_id}_{rem['task_id']}_{rem['time'].replace(':', '')}"
+            for job in context.job_queue.jobs():
+                if job.name == job_name:
+                    job.schedule_removal()
 
-            tasks_data[user_id]["reminders"] = []
-
-        save_tasks(tasks_data)
+        db.clear_all_tasks(user_id)
 
         response = f"🗑️🧑🏻‍💻 Cleared {task_count} task(s)!"
         if reminders_count > 0:
@@ -445,20 +393,21 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.edit_message_text(response)
 
     elif query.data == "clear_all_reminders":
-        if user_id not in tasks_data or not tasks_data[user_id].get("reminders"):
+        reminders = db.get_user_reminders(user_id)
+
+        if not reminders:
             await query.edit_message_text("📭🧑🏻‍💻 You have no reminders to clear!")
             return
 
         # Cancel all scheduled jobs
-        for rem in tasks_data[user_id]["reminders"]:
+        for rem in reminders:
             job_name = f"{user_id}_{rem['task_id']}_{rem['time'].replace(':', '')}"
             for job in context.job_queue.jobs():
                 if job.name == job_name:
                     job.schedule_removal()
 
-        count = len(tasks_data[user_id]["reminders"])
-        tasks_data[user_id]["reminders"] = []
-        save_tasks(tasks_data)
+        count = len(reminders)
+        db.clear_all_reminders(user_id)
         await query.edit_message_text(f"🗑️🧑🏻‍💻 Cleared {count} reminder(s)!")
 
 def main() -> None:
@@ -466,9 +415,11 @@ def main() -> None:
     if not token:
         raise ValueError("No TELEGRAM_TOKEN found in .env file!")
 
+    # Initialize database
+    db.init_db()
+
     # Create the Application
     application = Application.builder().token(token).build()
-    job_queue = application.job_queue
 
     # Register command handlers
     application.add_handler(CommandHandler("start", start))
@@ -484,40 +435,32 @@ def main() -> None:
     application.add_handler(CommandHandler("clearreminders", clear_reminders))
     application.add_handler(CallbackQueryHandler(button_callback))
 
-    # Reschedule reminders before run_polling
-    tasks_data = load_tasks()
-    total_users = len(tasks_data)
-    total_reminders = 0
-    total_tasks = 0
+    # Reschedule reminders on startup
+    all_reminders = db.get_all_reminders()
+    for rem in all_reminders:
+        now = datetime.now()
+        rem_time = datetime.strptime(rem["time"], "%H:%M").time()
+        target = datetime.combine(now.date(), rem_time)
+        if target < now:
+            target += timedelta(days=1)
+        delay = (target - now).total_seconds()
+        application.job_queue.run_once(
+            send_reminder,
+            when=delay,
+            data={
+                "user_id": rem["user_id"],
+                "task_id": rem["task_id"],
+                "task_text": rem["task_text"],
+                "days_left": rem["days_left"],
+                "time": rem["time"]
+            },
+            name=f"{rem['user_id']}_{rem['task_id']}_{rem['time'].replace(':', '')}"
+        )
 
-    for user_id, data in tasks_data.items():
-        total_tasks += len(data.get("tasks", []))
-        for rem in data.get("reminders", []):
-            task = next((t for t in data.get("tasks", []) if t["id"] == rem["task_id"]), None)
-            if task:
-                total_reminders += 1
-                now = datetime.now()
-                rem_time = datetime.strptime(rem["time"], "%H:%M").time()
-                target = datetime.combine(now.date(), rem_time)
-                if target < now:
-                    target += timedelta(days=1)
-                delay = (target - now).total_seconds()
-                application.job_queue.run_once(
-                    send_reminder,
-                    when=delay,
-                    data={
-                        "user_id": user_id,
-                        "task_id": task["id"],
-                        "task_text": task["task"],
-                        "days_left": rem["days_left"],
-                        "time": rem["time"]
-                    },
-                    name=f"{user_id}_{task['id']}_{rem['time'].replace(':', '')}"
-                )
-
-    # Start bot with enhanced logging
+    # Get stats and start bot
+    users, tasks, reminders = db.get_stats()
     print(f"🧑🏻‍💻 Bot is running...")
-    print(f"📊 Loaded: {total_users} user(s), {total_tasks} task(s), {total_reminders} reminder(s)")
+    print(f"📊 Loaded: {users} user(s), {tasks} task(s), {reminders} reminder(s)")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
